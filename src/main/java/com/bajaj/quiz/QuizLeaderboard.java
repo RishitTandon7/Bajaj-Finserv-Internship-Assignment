@@ -9,9 +9,11 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 
 import java.io.IOException;
 import java.net.URI;
+import java.net.URLEncoder;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.*;
@@ -51,7 +53,12 @@ public class QuizLeaderboard {
             System.exit(1);
         }
 
-        String regNo = args[0];
+        String regNo = args[0].trim();
+        if (regNo.isEmpty()) {
+            System.err.println("Error: Registration number cannot be blank.");
+            System.exit(1);
+        }
+
         Instant startTime = Instant.now();
 
         // ── Header ──────────────────────────────────────────────
@@ -221,7 +228,8 @@ public class QuizLeaderboard {
             String bar = "=".repeat(filled) + " ".repeat(barLen - filled);
             System.out.printf("  Poll %d/9  [%s] %d/%d  ", poll, bar, done, POLL_COUNT);
 
-            String url = BASE_URL + "/quiz/messages?regNo=" + regNo + "&poll=" + poll;
+            String encodedRegNo = URLEncoder.encode(regNo, StandardCharsets.UTF_8);
+            String url = BASE_URL + "/quiz/messages?regNo=" + encodedRegNo + "&poll=" + poll;
 
             HttpRequest request = HttpRequest.newBuilder()
                     .uri(URI.create(url))
@@ -306,7 +314,7 @@ public class QuizLeaderboard {
                 .timeout(Duration.ofSeconds(30))
                 .build();
 
-        HttpResponse<String> response = sendWithRetry(request);
+        HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
 
         System.out.println();
         if (response.statusCode() == 200 || response.statusCode() == 201) {
