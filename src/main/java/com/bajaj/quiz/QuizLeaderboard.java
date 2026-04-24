@@ -1,52 +1,43 @@
 package com.bajaj.quiz;
 
 import com.bajaj.quiz.model.LeaderboardEntry;
-import com.bajaj.quiz.model.PollResponse;
 import com.bajaj.quiz.model.QuizEvent;
-import com.bajaj.quiz.model.SubmitRequest;
 import com.bajaj.quiz.model.SubmitResponse;
-import com.fasterxml.jackson.databind.ObjectMapper;
+import com.bajaj.quiz.service.EventDeduplicator;
+import com.bajaj.quiz.service.QuizApiClient;
+import com.bajaj.quiz.service.ScoreAggregator;
 
-import java.io.IOException;
-import java.net.URI;
-import java.net.URLEncoder;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
-import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
-import java.util.*;
-import java.util.stream.Collectors;
+import java.util.ArrayList;
+import java.util.List;
 
 /**
  * Quiz Leaderboard System — Bajaj Finserv Health Java Qualifier
  *
- * Polls the quiz validator API 10 times (with 5-second delays),
- * deduplicates events by (roundId + participant), aggregates scores,
- * sorts descending by totalScore, and submits exactly once.
+ * Architecture:
+ *   QuizLeaderboard (orchestrator)
+ *   ├── QuizApiClient      — HTTP polling + submission with retry
+ *   ├── EventDeduplicator   — composite key (roundId|participant)
+ *   └── ScoreAggregator     — per-participant totals + leaderboard builder
  */
 public class QuizLeaderboard {
 
-    private static final String BASE_URL = "https://devapigw.vidalhealthtpa.com/srm-quiz-task";
     private static final int POLL_COUNT = 10;
     private static final int POLL_DELAY_SECONDS = 5;
-    private static final int MAX_RETRIES = 3;
-    private static final int RETRY_BASE_DELAY_SECONDS = 3;
 
-    private final HttpClient httpClient;
-    private final ObjectMapper objectMapper;
-    private final String regNo;
+    private final QuizApiClient apiClient;
+    private final EventDeduplicator deduplicator;
+    private final ScoreAggregator aggregator;
 
     public QuizLeaderboard(String regNo) {
-        this.regNo = regNo;
-        this.httpClient = HttpClient.newBuilder()
-                .connectTimeout(Duration.ofSeconds(15))
-                .build();
-        this.objectMapper = new ObjectMapper();
+        this.apiClient = new QuizApiClient(regNo);
+        this.deduplicator = new EventDeduplicator();
+        this.aggregator = new ScoreAggregator();
     }
 
     public static void main(String[] args) {
+        // ── CLI Validation ──────────────────────────────────────
         if (args.length < 1) {
             System.err.println("Usage: java -jar quiz-leaderboard.jar <regNo>");
             System.err.println("Example: java -jar quiz-leaderboard.jar RA2311003010587");
@@ -59,33 +50,34 @@ public class QuizLeaderboard {
             System.exit(1);
         }
 
+        new QuizLeaderboard(regNo).run(regNo);
+    }
+
+    private void run(String regNo) {
         Instant startTime = Instant.now();
 
         // ── Header ──────────────────────────────────────────────
-        printLine('=', 60);
+        line('=');
         System.out.println("  QUIZ LEADERBOARD SYSTEM");
         System.out.println("  Bajaj Finserv Health - Java Qualifier (SRM)");
-        printLine('=', 60);
+        line('=');
         System.out.println();
         System.out.println("  Registration No : " + regNo);
-        System.out.println("  API Endpoint    : " + BASE_URL);
+        System.out.println("  API Endpoint    : " + apiClient.getBaseUrl());
         System.out.println("  Poll Count      : " + POLL_COUNT + " (5s interval)");
         System.out.println("  Dedup Key       : roundId + participant");
         System.out.println();
-        printLine('-', 60);
-
-        QuizLeaderboard app = new QuizLeaderboard(regNo);
+        line('-');
 
         try {
-            // ── STEP 1: Poll API ────────────────────────────────
+            // ── STEP 1: Poll ────────────────────────────────────
             System.out.println();
             System.out.println("  [STEP 1/5] Polling API...");
             System.out.println();
 
-            List<QuizEvent> allEvents = app.pollAllEvents();
+            List<QuizEvent> allEvents = pollAll();
 
             if (allEvents.isEmpty()) {
-                System.err.println();
                 System.err.println("  ERROR: No events collected. The API server may be down.");
                 System.err.println("  Please try again later.");
                 System.exit(1);
@@ -93,29 +85,30 @@ public class QuizLeaderboard {
 
             // ── STEP 2: Collect ─────────────────────────────────
             System.out.println();
-            printLine('-', 60);
+            line('-');
             System.out.println();
             System.out.println("  [STEP 2/5] Collected " + allEvents.size() + " raw events");
 
             // ── STEP 3: Deduplicate ─────────────────────────────
-            List<QuizEvent> uniqueEvents = app.deduplicateEvents(allEvents);
-            int duplicates = allEvents.size() - uniqueEvents.size();
+            List<QuizEvent> uniqueEvents = deduplicator.deduplicate(allEvents);
+            int dupes = allEvents.size() - uniqueEvents.size();
             System.out.println("  [STEP 3/5] Deduplicated: " + uniqueEvents.size()
-                    + " unique, " + duplicates + " duplicates removed");
+                    + " unique, " + dupes + " duplicates removed");
 
             // ── STEP 4: Aggregate ───────────────────────────────
-            List<LeaderboardEntry> leaderboard = app.aggregateScores(uniqueEvents);
+            aggregator.addAll(uniqueEvents);
+            List<LeaderboardEntry> leaderboard = aggregator.buildLeaderboard();
             System.out.println("  [STEP 4/5] Aggregated scores for "
-                    + leaderboard.size() + " participants");
+                    + aggregator.participantCount() + " participants");
 
-            // ── Display Leaderboard ─────────────────────────────
+            // ── Leaderboard ─────────────────────────────────────
             System.out.println();
-            printLine('=', 60);
+            line('=');
             System.out.println("  FINAL LEADERBOARD");
-            printLine('=', 60);
+            line('=');
             System.out.println();
             System.out.printf("  %-6s %-20s %12s%n", "RANK", "PARTICIPANT", "TOTAL SCORE");
-            printLine('-', 60);
+            line('-');
 
             for (int i = 0; i < leaderboard.size(); i++) {
                 LeaderboardEntry e = leaderboard.get(i);
@@ -129,32 +122,49 @@ public class QuizLeaderboard {
                         "#" + (i + 1), e.getParticipant(), e.getTotalScore(), medal);
             }
 
-            printLine('-', 60);
-            int grandTotal = leaderboard.stream().mapToInt(LeaderboardEntry::getTotalScore).sum();
-            System.out.printf("  %-6s %-20s %12d%n", "", "GRAND TOTAL", grandTotal);
+            line('-');
+            System.out.printf("  %-6s %-20s %12d%n", "", "GRAND TOTAL", aggregator.grandTotal());
             System.out.println();
 
             // ── STEP 5: Submit ──────────────────────────────────
             System.out.println("  [STEP 5/5] Submitting leaderboard...");
-            app.submitLeaderboard(leaderboard);
+            System.out.println();
+            line('-');
+            System.out.println("  POST " + apiClient.getBaseUrl() + "/quiz/submit");
+
+            SubmitResponse result = apiClient.submit(leaderboard);
+
+            line('-');
+            System.out.println();
+            System.out.println("  STATUS  : 200 - ACCEPTED");
+            System.out.println("  RegNo   : " + result.getRegNo());
+            System.out.println("  Polls   : " + result.getTotalPollsMade());
+            System.out.println("  Total   : " + result.getSubmittedTotal());
+            System.out.println("  Attempt : " + result.getAttemptCount());
+            if (result.getIsCorrect() != null) {
+                System.out.println("  Correct : " + result.getIsCorrect());
+            }
+            if (result.getMessage() != null) {
+                System.out.println("  Message : " + result.getMessage());
+            }
 
             // ── Summary ─────────────────────────────────────────
             long elapsed = Duration.between(startTime, Instant.now()).getSeconds();
             System.out.println();
-            printLine('=', 60);
+            line('=');
             System.out.println("  EXECUTION SUMMARY");
-            printLine('=', 60);
+            line('=');
             System.out.println();
             System.out.println("  Registration     : " + regNo);
             System.out.println("  Raw Events       : " + allEvents.size());
-            System.out.println("  Duplicates       : " + duplicates);
+            System.out.println("  Duplicates       : " + dupes);
             System.out.println("  Unique Events    : " + uniqueEvents.size());
-            System.out.println("  Participants     : " + leaderboard.size());
-            System.out.println("  Grand Total      : " + grandTotal);
+            System.out.println("  Participants     : " + aggregator.participantCount());
+            System.out.println("  Grand Total      : " + aggregator.grandTotal());
             System.out.println("  Elapsed Time     : " + elapsed + "s");
             System.out.println("  Status           : COMPLETE");
             System.out.println();
-            printLine('=', 60);
+            line('=');
 
         } catch (Exception e) {
             System.err.println();
@@ -164,52 +174,11 @@ public class QuizLeaderboard {
         }
     }
 
-    /** Prints a horizontal line of the given character and length. */
-    private static void printLine(char ch, int length) {
-        System.out.println(String.valueOf(ch).repeat(length));
-    }
-
     /**
-     * Sends an HTTP request with retry logic for 5xx server errors.
-     * Retries up to MAX_RETRIES times with exponential backoff.
+     * Polls the API 10 times with mandatory 5-second delays.
+     * Shows a progress bar and timestamps for each poll.
      */
-    private HttpResponse<String> sendWithRetry(HttpRequest request)
-            throws IOException, InterruptedException {
-
-        HttpResponse<String> response = null;
-        for (int attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-            try {
-                response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
-
-                if (response.statusCode() < 500) {
-                    return response;
-                }
-
-                if (attempt < MAX_RETRIES) {
-                    int delay = RETRY_BASE_DELAY_SECONDS * (int) Math.pow(2, attempt);
-                    System.out.printf("             Retry %d/%d in %ds (server returned %d)%n",
-                            attempt + 1, MAX_RETRIES, delay, response.statusCode());
-                    Thread.sleep(delay * 1000L);
-                }
-            } catch (java.net.http.HttpTimeoutException e) {
-                if (attempt < MAX_RETRIES) {
-                    int delay = RETRY_BASE_DELAY_SECONDS * (int) Math.pow(2, attempt);
-                    System.out.printf("             Retry %d/%d in %ds (timeout)%n",
-                            attempt + 1, MAX_RETRIES, delay);
-                    Thread.sleep(delay * 1000L);
-                } else {
-                    throw e;
-                }
-            }
-        }
-        return response;
-    }
-
-    /**
-     * Polls the quiz API 10 times (index 0-9) with a mandatory
-     * 5-second delay between each request. Retries on server errors.
-     */
-    private List<QuizEvent> pollAllEvents() throws IOException, InterruptedException {
+    private List<QuizEvent> pollAll() throws Exception {
         List<QuizEvent> allEvents = new ArrayList<>();
 
         for (int poll = 0; poll < POLL_COUNT; poll++) {
@@ -221,35 +190,20 @@ public class QuizLeaderboard {
                 System.out.print("\r                  \r");
             }
 
-            // Progress bar: [=====     ] 5/10
+            // Progress bar
             int done = poll + 1;
             int barLen = 20;
             int filled = (done * barLen) / POLL_COUNT;
             String bar = "=".repeat(filled) + " ".repeat(barLen - filled);
-            System.out.printf("  Poll %d/9  [%s] %d/%d  ", poll, bar, done, POLL_COUNT);
 
-            String encodedRegNo = URLEncoder.encode(regNo, StandardCharsets.UTF_8);
-            String url = BASE_URL + "/quiz/messages?regNo=" + encodedRegNo + "&poll=" + poll;
+            System.out.printf("  [%s] Poll %d/9  %d/%d  ", QuizApiClient.timestamp(), poll, done, POLL_COUNT);
 
-            HttpRequest request = HttpRequest.newBuilder()
-                    .uri(URI.create(url))
-                    .GET()
-                    .timeout(Duration.ofSeconds(30))
-                    .build();
+            List<QuizEvent> events = apiClient.poll(poll);
 
-            HttpResponse<String> response = sendWithRetry(request);
-
-            if (response.statusCode() != 200) {
-                System.out.printf("FAIL (%d)%n", response.statusCode());
-                continue;
-            }
-
-            PollResponse pollResponse = objectMapper.readValue(response.body(), PollResponse.class);
-            List<QuizEvent> events = pollResponse.getEvents();
-            int count = (events != null) ? events.size() : 0;
-            System.out.printf("OK  +%d event(s)%n", count);
-
-            if (events != null) {
+            if (events.isEmpty()) {
+                System.out.println("FAIL");
+            } else {
+                System.out.printf("OK  +%d event(s)%n", events.size());
                 allEvents.addAll(events);
             }
         }
@@ -257,85 +211,8 @@ public class QuizLeaderboard {
         return allEvents;
     }
 
-    /**
-     * Deduplicates events using the composite key: roundId + participant.
-     * Only the first occurrence of each unique key is kept.
-     */
-    private List<QuizEvent> deduplicateEvents(List<QuizEvent> events) {
-        Set<String> seen = new LinkedHashSet<>();
-        List<QuizEvent> unique = new ArrayList<>();
-
-        for (QuizEvent event : events) {
-            String compositeKey = event.getRoundId() + "|" + event.getParticipant();
-            if (seen.add(compositeKey)) {
-                unique.add(event);
-            }
-        }
-
-        return unique;
-    }
-
-    /**
-     * Aggregates scores per participant and returns the leaderboard
-     * sorted in descending order by totalScore.
-     */
-    private List<LeaderboardEntry> aggregateScores(List<QuizEvent> uniqueEvents) {
-        Map<String, Integer> scoreMap = new LinkedHashMap<>();
-
-        for (QuizEvent event : uniqueEvents) {
-            scoreMap.merge(event.getParticipant(), event.getScore(), Integer::sum);
-        }
-
-        return scoreMap.entrySet().stream()
-                .map(e -> new LeaderboardEntry(e.getKey(), e.getValue()))
-                .sorted(Comparator.comparingInt(LeaderboardEntry::getTotalScore).reversed())
-                .collect(Collectors.toList());
-    }
-
-    /**
-     * Submits the final leaderboard via POST /quiz/submit — exactly once.
-     */
-    private void submitLeaderboard(List<LeaderboardEntry> leaderboard)
-            throws IOException, InterruptedException {
-
-        SubmitRequest payload = new SubmitRequest(regNo, leaderboard);
-        String jsonBody = objectMapper.writeValueAsString(payload);
-
-        System.out.println();
-        printLine('-', 60);
-        System.out.println("  POST " + BASE_URL + "/quiz/submit");
-        System.out.println("  Payload: " + jsonBody);
-        printLine('-', 60);
-
-        HttpRequest request = HttpRequest.newBuilder()
-                .uri(URI.create(BASE_URL + "/quiz/submit"))
-                .header("Content-Type", "application/json")
-                .POST(HttpRequest.BodyPublishers.ofString(jsonBody))
-                .timeout(Duration.ofSeconds(30))
-                .build();
-
-        HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
-
-        System.out.println();
-        if (response.statusCode() == 200 || response.statusCode() == 201) {
-            SubmitResponse result = objectMapper.readValue(response.body(), SubmitResponse.class);
-            System.out.println("  STATUS  : " + response.statusCode() + " - ACCEPTED");
-            System.out.println("  RegNo   : " + result.getRegNo());
-            System.out.println("  Polls   : " + result.getTotalPollsMade());
-            System.out.println("  Total   : " + result.getSubmittedTotal());
-            System.out.println("  Attempt : " + result.getAttemptCount());
-            if (result.getIsCorrect() != null) {
-                System.out.println("  Correct : " + result.getIsCorrect());
-            }
-            if (result.getExpectedTotal() != null) {
-                System.out.println("  Expected: " + result.getExpectedTotal());
-            }
-            if (result.getMessage() != null) {
-                System.out.println("  Message : " + result.getMessage());
-            }
-        } else {
-            System.err.println("  STATUS  : " + response.statusCode() + " - FAILED");
-            System.err.println("  Response: " + response.body());
-        }
+    /** Prints a horizontal line. */
+    private static void line(char ch) {
+        System.out.println(String.valueOf(ch).repeat(60));
     }
 }
