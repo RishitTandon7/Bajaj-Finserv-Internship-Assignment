@@ -17,7 +17,6 @@ import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.LocalTime;
 import java.time.format.DateTimeFormatter;
-import java.util.ArrayList;
 import java.util.List;
 
 /**
@@ -88,10 +87,7 @@ public class QuizApiClient {
                 .timeout(Duration.ofSeconds(30))
                 .build();
 
-        // Submit uses sendWithRetry too — but the assignment says submit exactly once.
-        // The retry here only retries on 5xx server errors (transient failures),
-        // which means the server didn't process our request.
-        HttpResponse<String> response = sendWithRetry(request);
+        HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
 
         if (response.statusCode() == 200 || response.statusCode() == 201) {
             return objectMapper.readValue(response.body(), SubmitResponse.class);
